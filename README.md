@@ -1,6 +1,6 @@
-# zfs-bulk
+# zfs-sentinel — Bulk changes with operator safety
 
-Bulk-apply ZFS properties across multiple datasets with operator-grade safety, clarity, and audit breadcrumbs. Dry-run by default, with clean previews, highlighted warnings, and ergonomics for CI and interactive use.
+I built zfs-sentinel to safely apply ZFS property changes across many datasets when built‑in options aren’t enough. It defaults to a dry‑run preview, highlights planned changes, displays a high‑visibility warning banner, and offers audit logging and automation flags for CI and scripted workflows.
 
 ---
 
