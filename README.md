@@ -1,72 +1,71 @@
-# zfs-sentinel — Bulk changes with operator safety
+# zfs-sentinel — Safe, auditable sentinel ZFS property management
 
-I built zfs-sentinel to safely apply ZFS property changes across many datasets when built‑in options aren’t enough. It defaults to a dry‑run preview, highlights planned changes, displays a high‑visibility warning banner, and offers audit logging and automation flags for CI and scripted workflows.
+A compact CLI that safely applies ZFS property changes across many datasets. Dry-run by default, operator-guarded for live runs, and audit-ready for CI and compliance.
 
----
+## Quick highlights ##
 
-## Why this exists
-
-- Prevent mistakes: Dry-run first, confirmation required unless explicitly skipped.
-- See everything: Color-coded param=value, alternating dataset names, and a high-visibility warning banner.
-- Automate safely: Flags for no-color, no-clear, and non-interactive runs that won’t wreck your terminal or logs.
-- Audit-friendly: Optional logging of applied changes with timestamps and dataset lists.
-
----
-
-## Features
-
-- Dry-run by default; explicit `--dry-run` overrides `--im-sure` if both are present
-- Param/value highlighting for quick visual parsing
-- Dataset preview with alternating colors and wide layout
-- Warning banner always shown before action
-- Spinner/progress during live runs
-- Invalid flag detection with clear breadcrumbs
-- Debug mode to echo parsed configuration and matched datasets
-- Automation flags: `--yes`, `--no-color`, `--no-clear`
-- Audit logs: `--log <file>`
+- Default safety: Dry-run preview unless explicitly confirmed with `--im-sure`
+- Triple-lock approval: dry-run, token-based approval for sensitive properties, and typed interactive confirmation in a TTY.
+- Flexible selection: glob, substring grep ``--grep``, or extended regex ``--regex`` matching
+- Audit-ready: append-only structured logs including timestamp, UID, PID, and dataset list.
+- Automation-friendly: ``dry-mode``, `--yes`, `--no-color`, `--no-clear`, and `--log` <file> for headless or CI environments.
+- Operator UX: colorized param/value preview, high-visibility warning banner, debug mode, and non-fatal per-dataset error handling.
 
 ---
 
-## Installation
+# Prerequisites #
+
+- **Platform:** Linux distributions with ZFS on Linux / OpenZFS installed and a POSIX shell.
+
+- **Commands:** zfs, zpool, sh, mkdir, chmod, chown, date, tput, sed, cut, head, base64, printf, read.
+
+- **Shell:** Bash 4.4 or newer for array handling and robust string features.
+
+- **Privileges:** Root or a user with sufficient privileges to run zfs/zpool operations and write to system locations used for logging and token storage.
+
+---
+
+# Installation #
+
+## Clone and install ##
 
 ```bash
-# Clone and install
-git clone https://github.com/meabert/zfs-bulk.git
-cd zfs-bulk
-sudo install -m 0755 zfs-bulk /usr/local/bin/zfs-bulk
+git clone https://github.com/meabert/zfs-sentinel.git
+cd zfs-sentinel
+sudo install -m 0755 zfs-sentinel /usr/local/bin/zfs-sentinel
 ```
-
-# Or run in place
+## Or run in place ##
 
 ```bash
-chmod +x zfs-bulk
-./zfs-bulk -h
+chmod +x zfs-sentinel
+./zfs-sentinel -h
 ```
+
 
 # If you want to make it globally available:
 
 ```bash
-sudo install -m 0755 zfs-bulk /usr/local/bin/zfs-bulk
+sudo install -m 0755 zfs-sentinel /usr/local/bin/zfs-sentinel
 ```
 
 ## Preview changes across a set of datasets (dry-run)
 ```bash 
-zfs-bulk compression=lz4 pool/app/*
+zfs-sentinel compression=lz4 pool/app/*
 ```
 
 ## Apply for real (interactive confirmation)
 ```bash 
-zfs-bulk canmount=on pool/app/* --im-sure
+zfs-sentinel canmount=on pool/app/* --im-sure
 ```
 
 ## Non-interactive automation, no color, no clear, logs to file
 ```bash
-zfs-bulk atime=off pool/app/* --im-sure --yes --no-color --no-clear --log /var/log/zfs-bulk.log
+zfs-sentinel atime=off pool/app/* --im-sure --yes --no-color --no-clear --log /var/log/zfs-sentinel.log
 ```
 
 ## Usage
 ```bash
-zfs-bulk <property=value> <pattern> [options]
+zfs-sentinel <property=value> <pattern> [options]
 ```
 - property=value: ZFS property assignment (e.g., compression=lz4, atime=off, recordsize=1M)
 
@@ -105,7 +104,7 @@ ZFS properties can change IO behavior, durability, and performance characteristi
 
 Always start with a dry-run and examine the preview and warning banner.
 
-Consider staging changes (e.g., test datasets first) before bulk operations on production.
+Consider staging changes (e.g., test datasets first) before sentinel operations on production.
 
 Color palette
 The script includes a unified ANSI palette (bold, backgrounds) and uses:
@@ -130,7 +129,7 @@ Plain text; no ANSI codes
 Example:
 
 bash
-zfs-bulk compression=lz4 pool/app/* --im-sure --yes --log /var/log/zfs-bulk.log
+zfs-sentinel compression=lz4 pool/app/* --im-sure --yes --log /var/log/zfs-sentinel.log
 Contributing
 Issues and PRs welcome. Please include:
 
