@@ -16,7 +16,8 @@ C_BRED="\033[1;31m";    C_BGREEN="\033[1;32m";  C_BYELLOW="\033[1;33m"
 C_BMAGENTA="\033[1;35m";C_BCYAN="\033[1;36m"
 BG_YELLOW="\033[43m";   C_BLACK="\033[0;30m"
 
-LOGFILE=""
+# sensible default log location; can be overridden via --log
+LOGFILE="/var/log/zfs-sentinel.log"
 NO_COLOR=false
 NO_CLEAR=false
 AUTO_YES=false
@@ -26,6 +27,8 @@ DEBUG=false
 
 # default expected token file for destructive ops (operator-managed)
 REQUIRED_TOKEN_FILE="/etc/zfs-sentinel/confirm.token"
+# capture original invocation for audit entries (preserve before shifts)
+ORIGINAL_CMD="$PROG_NAME $*"
 
 show_help() {
     cat <<EOF
@@ -73,7 +76,6 @@ YES=0
 SKIP_TOKEN=0
 CONFIRM_TOKEN=""
 TOKEN_FILE=/etc/zfs-sentinel/confirm.token
-LOGFILE=/var/log/zfs-sentinel.log
 
 # ---------------------------
 # Helper: append to audit log (atomic-ish)
