@@ -24,6 +24,15 @@ declare -a LOCK_FILES=()
 LOCK_DIR="/var/run/zfs-sentinel"
 PID_FILE=""
 
+# Minimal logging stubs to allow cleanup/traps to run before full logger is defined.
+# These are overridden later by the real implementations.
+DEBUG=false
+log_entry() { :; }
+debug() { :; }
+info() { :; }
+warn() { :; }
+error() { echo "ERROR: $*" >&2; }
+
 # Handle cleanup on script exit
 cleanup() {
     local exit_code="${1:-0}"
@@ -279,30 +288,55 @@ check_proxmox_environment() {
     echo -e "\n${C_BCYAN}Memory Usage:${C_RESET} ${mem_used_percent}%"
     
     # In NPS1 mode, we check overall memory pressure instead of per-NUMA node
-    local memory_pressure
     if [ -f "/proc/pressure/memory" ]; then
-        memory_pressure=$(grep "some avg10" /proc/pressure/memory | awk '{print $3}' | cut -d. -f1)
-        echo -e "${C_BCYAN}Memory Pressure (10s avg):${C_RESET} ${memory_pressure}%"
-        if [ "$memory_pressure" -gt 50 ]; then
+        # Try to extract avg10, fall back to avg60 or avg300; convert to integer percent
+        memory_pressure=0
+        memory_label="avg"
+        read -r mp_line < /proc/pressure/memory
+        if echo "$mp_line" | grep -q "avg10="; then
+            memory_label="avg10"
+            mp_val=$(echo "$mp_line" | sed -n 's/.*avg10=\([0-9.]*\).*/\1/p')
+        elif echo "$mp_line" | grep -q "avg60="; then
+            memory_label="avg60"
+            mp_val=$(echo "$mp_line" | sed -n 's/.*avg60=\([0-9.]*\).*/\1/p')
+        elif echo "$mp_line" | grep -q "avg300="; then
+            memory_label="avg300"
+            mp_val=$(echo "$mp_line" | sed -n 's/.*avg300=\([0-9.]*\).*/\1/p')
+        else
+            mp_val=0
+        fi
+        # Convert decimal string to integer percent (e.g., 0.01 -> 1)
+        if [[ "$mp_val" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            memory_pressure=$(printf "%d" "$(awk -v v="$mp_val" 'BEGIN { printf "%f", v*100 }')" 2>/dev/null || printf "%d" 0)
+        else
+            memory_pressure=0
+        fi
+        echo -e "${C_BCYAN}Memory Pressure (${memory_label} 10s avg):${C_RESET} ${memory_pressure}%"
+        if [ "${memory_pressure:-0}" -gt 50 ]; then
             warn "High memory pressure detected: ${memory_pressure}%"
             ((warn_count++))
         fi
     fi
-    
+
     # Check CPU cache coherency domains (CCX) for EPYC
     if [ -d "/sys/devices/system/cpu/cpu0/cache/index3" ]; then
         echo -e "${C_BCYAN}L3 Cache Domain Distribution:${C_RESET}"
-        for ((i=0; i<L3_CACHE_DOMAINS; i++)); do
-            local cpu_list
-            cpu_list=$(find /sys/devices/system/cpu/cpu*/cache/index3 -name "shared_cpu_list" | head -n1 | xargs cat)
-            echo "  CCX $i CPUs: $cpu_list"
-        done
+        # Collect shared_cpu_list files and iterate to show per-CCX CPU lists
+        mapfile -t ccx_files < <(find /sys/devices/system/cpu/cpu*/cache/index3 -name shared_cpu_list | sort -V 2>/dev/null)
+        if [ ${#ccx_files[@]} -eq 0 ]; then
+            echo "  (no CCX cpu lists found)"
+        else
+            for i in "${!ccx_files[@]}"; do
+                cpu_list=$(cat "${ccx_files[$i]}" 2>/dev/null || echo "unknown")
+                echo "  CCX $i CPUs: $cpu_list"
+            done
+        fi
     fi
     
     if [ "${mem_used_percent}" -gt "$MEMORY_THRESHOLD" ]; then
         error "High memory usage detected: ${mem_used_percent}% (threshold: ${MEMORY_THRESHOLD}%)"
         ((error_count++))
-    }
+    fi
     
     # Check ARC size vs total memory
     if command -v arcstat >/dev/null 2>&1; then
@@ -311,10 +345,13 @@ check_proxmox_environment() {
         local total_mem
         total_mem=$(free -b | grep Mem | awk '{print $2}')
         local arc_percent
-        arc_percent=$((arc_size * 100 / total_mem))
+        arc_percent=0
+        if [[ "$arc_size" =~ ^[0-9]+$ ]] && [[ "$total_mem" =~ ^[0-9]+$ ]] && [ "$total_mem" -gt 0 ]; then
+            arc_percent=$((arc_size * 100 / total_mem))
+        fi
         echo -e "${C_BCYAN}ZFS ARC Usage:${C_RESET} ${arc_percent}%"
         
-        if [ "$arc_percent" -gt 60 ]; then
+        if [[ "$arc_percent" =~ ^[0-9]+$ ]] && [ "$arc_percent" -gt 60 ]; then
             warn "ZFS ARC is using ${arc_percent}% of system memory"
             ((warn_count++))
         fi
@@ -322,14 +359,40 @@ check_proxmox_environment() {
     
     # Check IO wait and CPU load (EPYC NPS1-optimized)
     local io_wait
-    io_wait=$(top -bn1 | grep "Cpu(s)" | awk '{print int($10)}')
+    # Extract IO wait as integer, fallback to 0 if parsing fails
+    io_wait=$(top -bn1 | awk -F"," '/Cpu\(s\)/ { for(i=1;i<=NF;i++) if ($i ~ /id/) { split($i,a," "); print int(a[1]) ; exit } }' 2>/dev/null || true)
+    # The above gives idle; compute io wait as 100-idle if numeric
+    if [[ "$io_wait" =~ ^[0-9]+$ ]]; then
+        io_wait=$((100 - io_wait))
+    else
+        io_wait=0
+    fi
     echo -e "${C_BCYAN}IO Wait:${C_RESET} ${io_wait}%"
     
     # Check CPU scheduler domain pressure
     if [ -f "/proc/pressure/cpu" ]; then
-        local cpu_pressure
-        cpu_pressure=$(grep "some avg10" /proc/pressure/cpu | awk '{print $3}' | cut -d. -f1)
-        echo -e "${C_BCYAN}CPU Pressure (10s avg):${C_RESET} ${cpu_pressure}%"
+        # Extract avg10/avg60/avg300 similar to memory parsing
+        cpu_pressure=0
+        cpu_label="avg"
+        read -r cp_line < /proc/pressure/cpu
+        if echo "$cp_line" | grep -q "avg10="; then
+            cpu_label="avg10"
+            cp_val=$(echo "$cp_line" | sed -n 's/.*avg10=\([0-9.]*\).*/\1/p')
+        elif echo "$cp_line" | grep -q "avg60="; then
+            cpu_label="avg60"
+            cp_val=$(echo "$cp_line" | sed -n 's/.*avg60=\([0-9.]*\).*/\1/p')
+        elif echo "$cp_line" | grep -q "avg300="; then
+            cpu_label="avg300"
+            cp_val=$(echo "$cp_line" | sed -n 's/.*avg300=\([0-9.]*\).*/\1/p')
+        else
+            cp_val=0
+        fi
+        if [[ "$cp_val" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            cpu_pressure=$(printf "%d" "$(awk -v v="$cp_val" 'BEGIN { printf "%f", v*100 }')" 2>/dev/null || printf "%d" 0)
+        else
+            cpu_pressure=0
+        fi
+        echo -e "${C_BCYAN}CPU Pressure (${cpu_label} 10s avg):${C_RESET} ${cpu_pressure}%"
         if [ "$cpu_pressure" -gt 40 ]; then
             warn "High CPU pressure detected: ${cpu_pressure}%"
             ((warn_count++))
@@ -356,16 +419,18 @@ check_proxmox_environment() {
     local load_avg
     load_avg=$(cut -d ' ' -f1 /proc/loadavg)
     echo -e "${C_BCYAN}System Load Average:${C_RESET} $load_avg (max recommended: $MAX_LOAD)"
-    
-    if [ "$(echo "$load_avg > $MAX_LOAD" | bc -l)" -eq 1 ]; then
-        error "High system load detected: $load_avg (threshold: $MAX_LOAD)"
-        ((error_count++))
+    # Compare as floats using bc only if load_avg is numeric
+    if [[ "$load_avg" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        if [ "$(echo "$load_avg > $MAX_LOAD" | bc -l)" -eq 1 ]; then
+            error "High system load detected: $load_avg (threshold: $MAX_LOAD)"
+            ((error_count++))
+        fi
     fi
     
     if [ "${io_wait}" -gt "$IO_WAIT_THRESHOLD" ]; then
         error "High IO wait detected: ${io_wait}% (threshold: ${IO_WAIT_THRESHOLD}%)"
         ((error_count++))
-    }
+    fi
     
     # Check ZFS pool health
     if [ "$POOL_HEALTH_CHECK" = true ]; then
