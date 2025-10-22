@@ -65,11 +65,12 @@ if [ $# -eq 0 ]; then
     exit 0
 fi
 
-# ---------- Early help handling ----------
-if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    show_help
-    exit 0
-fi
+# Allow -h/--help anywhere on the command line
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) show_help; exit 0 ;;
+  esac
+done
 
 # ---------- Arg precheck ----------
 # First arg must be property=value (reject missing '=')
