@@ -65,25 +65,100 @@ if [ $# -eq 0 ]; then
     exit 0
 fi
 
-# Allow -h/--help anywhere on the command line
+# ---------------------------
+# Defaults / feature flags
+# ---------------------------
+IM_SURE=0
+YES=0
+SKIP_TOKEN=0
+CONFIRM_TOKEN=""
+TOKEN_FILE=/etc/zfs-sentinel/confirm.token
+LOGFILE=/var/log/zfs-sentinel.log
+
+# ---------------------------
+# Helper: append to audit log (atomic-ish)
+# ---------------------------
+audit_append() {
+  local entry ts tmp
+  ts="$(date --iso-8601=seconds)"
+  entry="$ts | UID=$(id -u) | PID=$$ | CMD=\"$*\""
+  tmp="$(mktemp "${LOGFILE}.XXXXXX")" || tmp="/tmp/zfs-sentinel.$$.log"
+  printf '%s\n' "$entry" > "$tmp" && mv "$tmp" "$LOGFILE"
+  chmod 600 "$LOGFILE" 2>/dev/null || true
+}
+
+# ---------------------------
+# Early-scan: allow -h/--help anywhere
+# ---------------------------
 for arg in "$@"; do
   case "$arg" in
     -h|--help) show_help; exit 0 ;;
   esac
 done
 
-# ---------- Arg precheck ----------
-# First argument must be property=value (reject missing '=')
-if [ -z "${1:-}" ] || [[ "$1" != *=* ]]; then
-    echo -e "${C_BRED}Invalid or missing property:${C_RESET} ${1:-<none>}"
-    echo "First argument must be property=value (e.g. compression=lz4)."
-    echo "Use -h or --help for usage."
-    exit 1
-fi
+# ---------------------------
+# Quick arg parsing (example)
+# ---------------------------
+# This parsing is intentionally simple; merge into your parser if you have one.
+PARSED=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --im-sure) IM_SURE=1; shift ;;
+    --yes) YES=1; shift ;;
+    --skip-token) SKIP_TOKEN=1; shift ;;
+    --confirm=*) CONFIRM_TOKEN="${1#*=}"; shift ;;
+    --confirm) CONFIRM_TOKEN="$2"; shift 2 ;;
+    --debug) DEBUG=1; PARSED+=("$1"); shift ;;
+    --* ) PARSED+=("$1"); shift ;;   # keep other flags for later handling
+    *) PARSED+=("$1"); shift ;;
+  esac
+done
+# restore positional args if needed
+set -- "${PARSED[@]}"
 
+# ---------------------------
+# Arg precheck: first arg must be property=value
+# ---------------------------
+if [ -z "${1:-}" ] || [[ "$1" != *=* ]]; then
+  echo -e "${C_BRED}Invalid or missing property:${C_RESET} ${1:-<none>}"
+  echo "First argument must be property=value (e.g. compression=lz4)."
+  echo "Use -h or --help for usage."
+  exit 1
+fi
 
 prop="$1"
 shift
+
+# ---------------------------
+# Sensitive token resolution and guarded skip logic
+# ---------------------------
+# Gather provided token: explicit flag > env > file (if present)
+TOKEN_PROVIDED="${CONFIRM_TOKEN:-${IM_SURE_TOKEN:-$( [ -f "$TOKEN_FILE" ] && cat "$TOKEN_FILE" || true )}}"
+
+if is_sensitive "$prop"; then
+  if [ -z "$TOKEN_PROVIDED" ]; then
+    if [ "$SKIP_TOKEN" -eq 1 ] && [ "$IM_SURE" -eq 1 ] && [ "$YES" -eq 1 ]; then
+      echo -e "${C_BYEL}WARNING:${C_RESET} Sensitive property change WITHOUT token; SKIP_TOKEN used."
+      audit_append "SKIP_TOKEN used; PROP=$prop ARGS=\"$*\""
+    else
+      echo -e "${C_BRED}Error:${C_RESET} Required token file $TOKEN_FILE missing for sensitive property."
+      echo "Provide --confirm <token>, set IM_SURE_TOKEN, create $TOKEN_FILE, or use --skip-token --im-sure --yes to force."
+      exit 1
+    fi
+  else
+    # When a token file exists, validate provided token matches it (optional but recommended)
+    if [ -f "$TOKEN_FILE" ]; then
+      expected="$(cat "$TOKEN_FILE")"
+      if ! printf '%s' "$TOKEN_PROVIDED" | grep -Fxq "$expected"; then
+        echo -e "${C_BRED}Error:${C_RESET} Provided token does not match expected token."
+        exit 1
+      fi
+    fi
+  fi
+fi
+
+# Continue with main apply logic...
+
 
 mode="glob"
 pattern=""
