@@ -65,9 +65,16 @@ if [ $# -eq 0 ]; then
     exit 0
 fi
 
+# ---------- Early help handling ----------
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    show_help
+    exit 0
+fi
+
 # ---------- Arg precheck ----------
-if [[ "$1" == -* ]] || [[ "$1" != *=* ]]; then
-    echo -e "${C_BRED}Invalid flag or missing property:${C_RESET} $1"
+# First arg must be property=value (reject missing '=')
+if [[ "$1" != *=* ]]; then
+    echo -e "${C_BRED}Invalid or missing property:${C_RESET} $1"
     echo "First argument must be property=value (e.g. compression=lz4)."
     echo "Use -h or --help for usage."
     exit 1
