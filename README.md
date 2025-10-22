@@ -31,7 +31,7 @@ Bulk-apply ZFS properties across multiple datasets with operator-grade safety, c
 
 ```bash
 # Clone and install
-git clone https://github.com/<your-org-or-user>/zfs-bulk.git
+git clone https://github.com/meabert/zfs-bulk.git
 cd zfs-bulk
 sudo install -m 0755 zfs-bulk /usr/local/bin/zfs-bulk
 ```
