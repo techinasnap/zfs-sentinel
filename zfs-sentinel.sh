@@ -4,12 +4,428 @@
 # Safe by default: dry-run unless --im-sure supplied (--dry-run forces dry-run)
 # Triple-lock safety, audit logging, debug, grep/glob/regex matching
 #
+# shellcheck disable=SC2086  # Word splitting is intentional for pattern matching
+# shellcheck disable=SC2046  # Word splitting is intentional for dataset lists
+# shellcheck enable=require-variable-braces
+# shellcheck enable=check-set-e-suppressed
+
+VERSION="1.0.0"
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
+# Default timeout for operations (in seconds)
+DEFAULT_TIMEOUT=300
+
+# Temporary files/locks that need cleanup
+declare -a TEMP_FILES=()
+declare -a LOCK_FILES=()
+LOCK_DIR="/var/run/zfs-sentinel"
+PID_FILE=""
+
+# Handle cleanup on script exit
+cleanup() {
+    local exit_code="${1:-0}"
+    local error_msg="${2:-}"
+    
+    # 1. Log the cleanup start
+    debug "Starting cleanup (exit code: $exit_code, error: $error_msg)"
+    
+    # 2. Kill background processes
+    if jobs -p &>/dev/null; then
+        debug "Killing background processes..."
+        kill "$(jobs -p)" 2>/dev/null || true
+    fi
+    
+    # 3. Remove temporary files
+    if [ ${#TEMP_FILES[@]} -gt 0 ]; then
+        debug "Removing temporary files..."
+        for tmp in "${TEMP_FILES[@]}"; do
+            if [ -f "$tmp" ]; then
+                rm -f "$tmp" 2>/dev/null || debug "Failed to remove temp file: $tmp"
+            fi
+        done
+    fi
+    
+    # 4. Remove lock files
+    if [ ${#LOCK_FILES[@]} -gt 0 ]; then
+        debug "Removing lock files..."
+        for lock in "${LOCK_FILES[@]}"; do
+            if [ -f "$lock" ]; then
+                rm -f "$lock" 2>/dev/null || debug "Failed to remove lock file: $lock"
+            fi
+        done
+    fi
+    
+    # 5. Remove PID file if we created one
+    if [ -n "$PID_FILE" ] && [ -f "$PID_FILE" ]; then
+        debug "Removing PID file: $PID_FILE"
+        rm -f "$PID_FILE" 2>/dev/null || debug "Failed to remove PID file"
+    fi
+    
+    # 6. Log completion status
+    if [ "$exit_code" -ne 0 ]; then
+        error "Cleanup completed with errors (exit code: $exit_code, error: $error_msg)"
+    else
+        debug "Cleanup completed successfully"
+    fi
+    
+    exit "$exit_code"
+}
+
+# Create temporary file with cleanup registration
+make_temp_file() {
+    local tmp
+    tmp=$(mktemp) || {
+        error "Failed to create temporary file"
+        return 1
+    }
+    TEMP_FILES+=("$tmp")
+    echo "$tmp"
+}
+
+# Create and register lock file
+create_lock() {
+    local lock_name="$1"
+    local lock_file="$LOCK_DIR/$lock_name.lock"
+    
+    # Ensure lock directory exists
+    mkdir -p "$LOCK_DIR" 2>/dev/null || {
+        error "Failed to create lock directory: $LOCK_DIR"
+        return 1
+    }
+    
+    # Create lock file with PID
+    echo "$$" > "$lock_file" 2>/dev/null || {
+        error "Failed to create lock file: $lock_file"
+        return 1
+    }
+    
+    LOCK_FILES+=("$lock_file")
+    return 0
+}
+
+# Check current resource usage and state
+check_resources() {
+    local check_type="${1:-all}"  # all, temp, locks, processes
+    local verbose="${2:-false}"
+    
+    echo -e "\n${C_BYELLOW}Resource Check Report${C_RESET}"
+    echo "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "Process ID: $$"
+    
+    case "$check_type" in
+        "all"|"temp")
+            echo -e "\n${C_BCYAN}Temporary Files:${C_RESET}"
+            if [ ${#TEMP_FILES[@]} -eq 0 ]; then
+                echo "  No temporary files registered"
+            else
+                for tmp in "${TEMP_FILES[@]}"; do
+                    if [ -f "$tmp" ]; then
+                        local size
+                        size=$(stat -f %z "$tmp" 2>/dev/null || stat -c %s "$tmp" 2>/dev/null || echo "unknown")
+                        echo -e "  ${C_BGREEN}✓${C_RESET} $tmp (size: $size bytes)"
+                    else
+                        echo -e "  ${C_BRED}✗${C_RESET} $tmp (missing)"
+                    fi
+                done
+            fi
+            ;;
+    esac
+    
+    case "$check_type" in
+        "all"|"locks")
+            echo -e "\n${C_BCYAN}Lock Files:${C_RESET}"
+            if [ ${#LOCK_FILES[@]} -eq 0 ]; then
+                echo "  No lock files registered"
+            else
+                for lock in "${LOCK_FILES[@]}"; do
+                    if [ -f "$lock" ]; then
+                        local pid
+                        pid=$(cat "$lock" 2>/dev/null || echo "unreadable")
+                        echo -e "  ${C_BGREEN}✓${C_RESET} $lock (PID: $pid)"
+                    else
+                        echo -e "  ${C_BRED}✗${C_RESET} $lock (missing)"
+                    fi
+                done
+            fi
+            ;;
+    esac
+    
+    case "$check_type" in
+        "all"|"processes")
+            echo -e "\n${C_BCYAN}Background Processes:${C_RESET}"
+            local bg_procs
+            bg_procs=$(jobs -p)
+            if [ -z "$bg_procs" ]; then
+                echo "  No background processes"
+            else
+                while IFS= read -r pid; do
+                    if [ -n "$pid" ]; then
+                        local cmd
+                        cmd=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+                        echo -e "  ${C_BGREEN}✓${C_RESET} PID $pid ($cmd)"
+                    fi
+                done <<< "$bg_procs"
+            fi
+            ;;
+    esac
+    
+    if [ "$verbose" = "true" ]; then
+        echo -e "\n${C_BCYAN}System Resources:${C_RESET}"
+        echo "  Open Files: $(lsof -p $$ 2>/dev/null | wc -l)"
+        echo "  Memory Usage: $(ps -o rss= -p $$ 2>/dev/null || echo "unknown") KB"
+        echo "  CPU Time: $(ps -o time= -p $$ 2>/dev/null || echo "unknown")"
+    fi
+    
+    echo -e "\n${C_BYELLOW}End Resource Report${C_RESET}\n"
+}
+
+# Timeout handler
+handle_timeout() {
+    echo -e "\n${C_BRED}Error:${C_RESET} Operation timed out after ${TIMEOUT:-$DEFAULT_TIMEOUT} seconds"
+    cleanup 21
+}
+
+# Environment validation
+validate_environment() {
+    # Check if we're running with sufficient privileges
+    if [ "$(id -u)" -ne 0 ] && ! groups | grep -q zfs; then
+        echo -e "${C_BRED}Error:${C_RESET} Must run as root or user in 'zfs' group"
+        exit 22
+    fi
+
+    # Ensure TERM is set for tput
+    if [ -z "${TERM:-}" ]; then
+        export TERM=dumb
+    fi
+
+    # Check if custom timeout is valid
+    if [ -n "${TIMEOUT:-}" ] && ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+        echo -e "${C_BRED}Error:${C_RESET} TIMEOUT must be a positive integer"
+        exit 23
+    fi
+}
+
+trap 'cleanup $?' EXIT
+trap 'cleanup 1' INT TERM
+trap 'handle_timeout' ALRM
+
 PROG_NAME="$(basename "$0")"
+
+# ---------- Required Command Validation ----------
+check_required_commands() {
+    local missing=()
+    local required_cmds=(
+        "zfs"
+        "zpool"
+        "mkdir"
+        "chmod"
+        "chown"
+        "date"
+        "tput"
+        "sed"
+        "cut"
+        "head"
+        "base64"
+        "printf"
+        "read"
+        "free"      # For memory monitoring
+        "qm"        # Proxmox VM management
+        "pct"       # Proxmox CT management
+        "pvesh"     # Proxmox API shell
+    )
+
+    for cmd in "${required_cmds[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [ ${#missing[@]} -ne 0 ]; then
+        echo -e "${C_BRED}Error:${C_RESET} Required commands missing:"
+        printf '  %s\n' "${missing[@]}"
+        exit 20
+    fi
+}
+
+# ---------- Proxmox Environment Checks ----------
+# EPYC 7513 NPS1 Mode Optimized Thresholds
+MEMORY_THRESHOLD=94     # Higher threshold for single NUMA domain
+IO_WAIT_THRESHOLD=15    # EPYC 7513 has excellent I/O
+CPU_LOAD_THRESHOLD=60   # Higher threshold due to unified memory access
+POOL_HEALTH_CHECK=true
+VM_IMPACT_CHECK=true
+
+# CPU topology detection
+CORE_COUNT=$(nproc)
+MAX_LOAD=$((CORE_COUNT * CPU_LOAD_THRESHOLD / 100))
+
+# NPS1 specific settings
+NUMA_MODE="NPS1"
+SINGLE_NUMA_DOMAIN=true  # Optimizations for single NUMA domain
+L3_CACHE_DOMAINS=8       # EPYC 7513 has 8 CCX domains
+
+check_proxmox_environment() {
+    local error_count=0
+    local warn_count=0
+    
+    echo -e "\n${C_BYELLOW}Proxmox Environment Check (EPYC 7513 Optimized)${C_RESET}"
+    
+    # Check memory usage (NPS1-optimized)
+    local mem_used_percent
+    mem_used_percent=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
+    echo -e "\n${C_BCYAN}Memory Usage:${C_RESET} ${mem_used_percent}%"
+    
+    # In NPS1 mode, we check overall memory pressure instead of per-NUMA node
+    local memory_pressure
+    if [ -f "/proc/pressure/memory" ]; then
+        memory_pressure=$(grep "some avg10" /proc/pressure/memory | awk '{print $3}' | cut -d. -f1)
+        echo -e "${C_BCYAN}Memory Pressure (10s avg):${C_RESET} ${memory_pressure}%"
+        if [ "$memory_pressure" -gt 50 ]; then
+            warn "High memory pressure detected: ${memory_pressure}%"
+            ((warn_count++))
+        fi
+    fi
+    
+    # Check CPU cache coherency domains (CCX) for EPYC
+    if [ -d "/sys/devices/system/cpu/cpu0/cache/index3" ]; then
+        echo -e "${C_BCYAN}L3 Cache Domain Distribution:${C_RESET}"
+        for ((i=0; i<L3_CACHE_DOMAINS; i++)); do
+            local cpu_list
+            cpu_list=$(find /sys/devices/system/cpu/cpu*/cache/index3 -name "shared_cpu_list" | head -n1 | xargs cat)
+            echo "  CCX $i CPUs: $cpu_list"
+        done
+    fi
+    
+    if [ "${mem_used_percent}" -gt "$MEMORY_THRESHOLD" ]; then
+        error "High memory usage detected: ${mem_used_percent}% (threshold: ${MEMORY_THRESHOLD}%)"
+        ((error_count++))
+    }
+    
+    # Check ARC size vs total memory
+    if command -v arcstat >/dev/null 2>&1; then
+        local arc_size
+        arc_size=$(arcstat -s 1 1 | tail -n 1 | awk '{print $2}')
+        local total_mem
+        total_mem=$(free -b | grep Mem | awk '{print $2}')
+        local arc_percent
+        arc_percent=$((arc_size * 100 / total_mem))
+        echo -e "${C_BCYAN}ZFS ARC Usage:${C_RESET} ${arc_percent}%"
+        
+        if [ "$arc_percent" -gt 60 ]; then
+            warn "ZFS ARC is using ${arc_percent}% of system memory"
+            ((warn_count++))
+        fi
+    fi
+    
+    # Check IO wait and CPU load (EPYC NPS1-optimized)
+    local io_wait
+    io_wait=$(top -bn1 | grep "Cpu(s)" | awk '{print int($10)}')
+    echo -e "${C_BCYAN}IO Wait:${C_RESET} ${io_wait}%"
+    
+    # Check CPU scheduler domain pressure
+    if [ -f "/proc/pressure/cpu" ]; then
+        local cpu_pressure
+        cpu_pressure=$(grep "some avg10" /proc/pressure/cpu | awk '{print $3}' | cut -d. -f1)
+        echo -e "${C_BCYAN}CPU Pressure (10s avg):${C_RESET} ${cpu_pressure}%"
+        if [ "$cpu_pressure" -gt 40 ]; then
+            warn "High CPU pressure detected: ${cpu_pressure}%"
+            ((warn_count++))
+        fi
+    fi
+    
+    # Get per-CCX (Core Complex) CPU usage for EPYC with NPS1
+    if command -v mpstat >/dev/null 2>&1; then
+        echo -e "${C_BCYAN}CPU Complex Usage (NPS1 mode):${C_RESET}"
+        # Group CPUs by L3 cache domain in NPS1 mode
+        for ((i=0; i<CORE_COUNT; i+=8)); do
+            local ccx_usage
+            ccx_usage=$(mpstat -P $i,$(($i+1)),$(($i+2)),$(($i+3)),$(($i+4)),$(($i+5)),$(($i+6)),$(($i+7)) 1 1 | \
+                       awk 'END {print 100-$NF}')
+            echo "  CCX $((i/8)) usage: ${ccx_usage}%"
+            if [ "${ccx_usage%.*}" -gt 85 ]; then
+                warn "High CCX $((i/8)) usage: ${ccx_usage}%"
+                ((warn_count++))
+            fi
+        done
+    fi
+    
+    # Check system load average against EPYC core count
+    local load_avg
+    load_avg=$(cut -d ' ' -f1 /proc/loadavg)
+    echo -e "${C_BCYAN}System Load Average:${C_RESET} $load_avg (max recommended: $MAX_LOAD)"
+    
+    if [ "$(echo "$load_avg > $MAX_LOAD" | bc -l)" -eq 1 ]; then
+        error "High system load detected: $load_avg (threshold: $MAX_LOAD)"
+        ((error_count++))
+    fi
+    
+    if [ "${io_wait}" -gt "$IO_WAIT_THRESHOLD" ]; then
+        error "High IO wait detected: ${io_wait}% (threshold: ${IO_WAIT_THRESHOLD}%)"
+        ((error_count++))
+    }
+    
+    # Check ZFS pool health
+    if [ "$POOL_HEALTH_CHECK" = true ]; then
+        echo -e "\n${C_BCYAN}ZFS Pool Health:${C_RESET}"
+        while IFS= read -r pool; do
+            local health
+            health=$(zpool status "$pool" | grep -E "state:" | awk '{print $2}')
+            echo -e "  Pool ${C_BMAGENTA}${pool}${C_RESET}: ${health}"
+            if [ "$health" != "ONLINE" ]; then
+                error "Pool $pool is not healthy (state: $health)"
+                ((error_count++))
+            fi
+            
+            # Check pool capacity
+            local capacity
+            capacity=$(zpool list -H -o capacity "$pool" | tr -d '%')
+            echo -e "  Capacity: ${capacity}%"
+            if [ "$capacity" -gt 80 ]; then
+                warn "Pool $pool usage is high: ${capacity}%"
+                ((warn_count++))
+            fi
+        done < <(zpool list -H -o name)
+    fi
+    
+    # Check running VMs/CTs
+    if [ "$VM_IMPACT_CHECK" = true ]; then
+        echo -e "\n${C_BCYAN}Active VM/CT Check:${C_RESET}"
+        
+        # Check QEMU VMs
+        local running_vms=0
+        running_vms=$(qm list | grep -c "running" || echo "0")
+        echo "  Running VMs: $running_vms"
+        
+        # Check LXC containers
+        local running_cts=0
+        running_cts=$(pct list | grep -c "running" || echo "0")
+        echo "  Running CTs: $running_cts"
+        
+        # Warning if there are many active instances
+        if [ "$running_vms" -gt 0 ] || [ "$running_cts" -gt 0 ]; then
+            warn "Active VMs/CTs detected. Changes may impact running instances."
+            ((warn_count++))
+        fi
+    fi
+    
+    echo -e "\n${C_BCYAN}Summary:${C_RESET}"
+    echo "  Errors: $error_count"
+    echo "  Warnings: $warn_count"
+    
+    # Exit if critical issues found
+    if [ "$error_count" -gt 0 ]; then
+        error "Critical issues detected in Proxmox environment. Use --force to override."
+        return 1
+    elif [ "$warn_count" -gt 0 ]; then
+        warn "Non-critical issues detected. Proceeding with caution."
+    fi
+    
+    return 0
+}
+
 # ---------- Color Palette ----------
 C_RESET="\033[0m"
 C_BRED="\033[1;31m";    C_BGREEN="\033[1;32m";  C_BYELLOW="\033[1;33m"
@@ -45,6 +461,7 @@ Options:
   --no-color       Disable ANSI colors (plain text output)
   --no-clear       Do not clear the screen before confirmation
   --debug          Print parsed configuration and matched datasets
+  --check-resources Display current resource usage and state
 
 Examples:
   $PROG_NAME compression=lz4 oracle/secure*                 
@@ -53,6 +470,26 @@ Examples:
   $PROG_NAME recordsize=1M '^oracle/secure[0-9]+' -x --im-sure --yes --log /var/log/zfs-sentinel.log
 EOF
 }
+
+# ---------- Initial validation ----------
+check_required_commands
+validate_environment
+
+# Proxmox-specific checks
+if ! check_proxmox_environment; then
+    if [ "${FORCE:-false}" != "true" ]; then
+        error "Proxmox environment checks failed. Use --force to override."
+        exit 30
+    else
+        warn "Proceeding despite Proxmox environment warnings (--force)"
+    fi
+fi
+
+# Set operation timeout
+TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
+if command -v perl >/dev/null 2>&1; then
+    perl -e "alarm $TIMEOUT; exec @ARGV" "$0" "$@"
+fi
 
 # ---------- No-arg intro banner ----------
 if [ $# -eq 0 ]; then
@@ -99,6 +536,13 @@ while [ $# -gt 0 ]; do
         --no-clear) NO_CLEAR=true ;;
         --yes) AUTO_YES=true ;;
         --debug) DEBUG=true ;;
+        --check-resources)
+            check_resources "all" "true"
+            exit 0
+            ;;
+        --force)
+            FORCE=true
+            ;;
         -*)
             echo -e "${C_BRED}Invalid flag${C_RESET} $1"
             echo "Please use -h or --help for more info."
@@ -131,6 +575,20 @@ fi
 
 # ---------- Helpers: logging, debug, run wrapper ----------
 mkdir -p "$(dirname "${LOGFILE:-/var/log/zfs-sentinel.log}")" 2>/dev/null || true
+
+# Validate log file permissions if specified
+validate_logfile() {
+    if [ -n "$LOGFILE" ]; then
+        if [ -f "$LOGFILE" ] && ! [ -w "$LOGFILE" ]; then
+            echo -e "${C_BRED}Error:${C_RESET} Log file $LOGFILE is not writable." >&2
+            exit 14
+        fi
+        if ! [ -w "$(dirname "$LOGFILE")" ]; then
+            echo -e "${C_BRED}Error:${C_RESET} Log directory $(dirname "$LOGFILE") is not writable." >&2
+            exit 15
+        fi
+    fi
+}
 
 log_entry() {
     local level="$1"; shift
@@ -169,7 +627,8 @@ run_cmd() {
 }
 
 # ---------- Gather targets ----------
-targets=$(zfs list -H -o name 2>/dev/null || true)
+# Use -0 with zfs list to handle datasets with spaces
+targets=$(zfs list -H -0 -o name 2>/dev/null || true)
 if [ -z "$targets" ]; then
     echo -e "${C_BRED}Error:${C_RESET} No ZFS datasets found (zfs list returned empty)." >&2
     exit 6
@@ -192,6 +651,21 @@ fi
 # ---------- Split property ----------
 param="${prop%%=*}"
 val="${prop#*=}"
+
+# Validate property value
+validate_property() {
+    # Basic validation - property shouldn't be empty
+    if [ -z "$param" ] || [ -z "$val" ]; then
+        echo -e "${C_BRED}Error:${C_RESET} Invalid property format. Must be property=value" >&2
+        exit 16
+    fi
+
+    # Check if property exists (using first matched dataset)
+    if ! zfs get -H "$param" "${matched[0]}" >/dev/null 2>&1; then
+        echo -e "${C_BRED}Error:${C_RESET} Invalid or non-existent ZFS property: $param" >&2
+        exit 17
+    fi
+}
 
 # ---------- Debug dump ----------
 if [ "$DEBUG" = true ]; then
