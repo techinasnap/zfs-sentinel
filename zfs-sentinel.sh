@@ -73,13 +73,14 @@ for arg in "$@"; do
 done
 
 # ---------- Arg precheck ----------
-# First arg must be property=value (reject missing '=')
-if [[ "$1" != *=* ]]; then
-    echo -e "${C_BRED}Invalid or missing property:${C_RESET} $1"
+# First argument must be property=value (reject missing '=')
+if [ -z "${1:-}" ] || [[ "$1" != *=* ]]; then
+    echo -e "${C_BRED}Invalid or missing property:${C_RESET} ${1:-<none>}"
     echo "First argument must be property=value (e.g. compression=lz4)."
     echo "Use -h or --help for usage."
     exit 1
 fi
+
 
 prop="$1"
 shift
