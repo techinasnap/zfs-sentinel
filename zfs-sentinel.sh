@@ -313,6 +313,38 @@ print_preview() {
     echo
 }
 
+# ---------- Status summary (always shown before interactive confirmation) ----------
+print_status_summary() {
+    local intent token_msg
+    if [ "${APPLY:-false}" = true ] && [ "${FORCE_DRY:-false}" != true ]; then
+        intent="APPLY (changes will be made)"
+    else
+        intent="DRY-RUN (no changes will be made)"
+    fi
+
+    if [ "${SENSITIVE:-false}" = true ]; then
+        if [ "${SKIP_TOKEN:-0}" -eq 1 ] && [ "${APPLY:-false}" = true ] && [ "${AUTO_YES:-false}" = true ]; then
+            token_msg="SKIP_TOKEN (operator forced token skip)"
+        else
+            token_msg="[${TOKEN_PROVIDED:+provided}]${TOKEN_PROVIDED:-Token required}"
+        fi
+    else
+        token_msg="No token required"
+    fi
+
+    printf "\n===== zfs-sentinel summary =====\n"
+    printf "Property: %s=%s\n" "$param" "$val"
+    printf "Datasets: %d matched\n" "${#matched[@]}"
+    printf "Mode: %s   Pattern: %s\n" "$MODE" "$PATTERN"
+    printf "Intent: %s\n" "$intent"
+    printf "Confirmation: %s\n" "$token_msg"
+    printf "Auto-confirm (--yes): %s\n" "$AUTO_YES"
+    printf "Skip-token (--skip-token): %s\n" "$([ "${SKIP_TOKEN:-0}" -eq 1 ] && echo yes || echo no)"
+    printf "Logfile: %s\n" "${LOGFILE:-<none>}"
+    printf "================================\n\n"
+}
+
+
 # If not applying or forced dry-run, show preview and exit
 if [ "$APPLY" = false ] || [ "$FORCE_DRY" = true ]; then
     print_preview "${C_BYELLOW}Running in DRY-MODE:${C_RESET} Applying"
@@ -323,8 +355,11 @@ fi
 
 # ---------- Interactive typed confirmation unless AUTO_YES true or non-tty ----------
 if [ -t 0 ] && [ "$AUTO_YES" = false ]; then
-    if [ "$NO_CLEAR" = false ]; then printf "\033c"; fi
+    if [ "$NO_CLEAR" = false ]; then
+        printf "\033c"
+    fi
     print_preview "${C_BRED}You are about to apply${C_RESET}"
+    print_status_summary
     read -r -p "Type the dataset count (${#matched[@]}) to confirm, or type ABORT to cancel: " resp
     if [[ "$resp" == "ABORT" ]]; then
         echo "Aborted by operator."
